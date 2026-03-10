@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment and secrets
+.env
+.env.local
+
+# Logs and runtime output
+*.log
+*.err
+*.out
+*.pptx
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Build/cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Arduino transient build folders (when present)
+build/
+*.elf
+*.bin
