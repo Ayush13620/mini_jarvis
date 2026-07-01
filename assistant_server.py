@@ -9,9 +9,10 @@ import time
 import urllib.error
 import urllib.request
 import wave
+import hmac
 from datetime import datetime
 from collections import deque
-from typing import Deque, List, Optional
+from typing import Deque, List, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -47,7 +48,7 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4.1-mini")
 USE_OLLAMA_CHAT = os.getenv("USE_OLLAMA_CHAT", "true").lower() == "true"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:0.8b")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "local").strip().lower()
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
@@ -65,7 +66,7 @@ REQUIRE_WAKE_WORD = os.getenv("REQUIRE_WAKE_WORD", "false").lower() == "true"
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 AUDIO_DEBUG = os.getenv("AUDIO_DEBUG", "true").lower() == "true"
 DEBUG_EVERY_MS = int(os.getenv("DEBUG_EVERY_MS", "1500"))
-PCM_INT32_GAIN_DIV = max(1, int(os.getenv("PCM_INT32_GAIN_DIV", "4")))
+PCM_INT32_GAIN_DIV = max(1, int(os.getenv("PCM_INT32_GAIN_DIV", "1")))
 WAKE_ALIASES = [w.strip().lower() for w in os.getenv("WAKE_ALIASES", "").split(",") if w.strip()]
 ASYNC_TTS = os.getenv("ASYNC_TTS", "true").lower() == "true"
 BARGE_IN = os.getenv("BARGE_IN", "true").lower() == "true"
@@ -144,6 +145,18 @@ def int32_stream_to_int16(chunk: bytes) -> np.ndarray:
         s32 = s32 // PCM_INT32_GAIN_DIV
     s16 = np.clip(s32, -32768, 32767).astype(np.int16)
     return s16
+
+
+def command_looks_like_stop(text: str) -> bool:
+    clean = (text or "").strip().lower().strip(" .,!?:;")
+    return clean in {
+        "stop",
+        "stop talking",
+        "quiet",
+        "be quiet",
+        "silence",
+        "cancel",
+    }
 
 
 def is_noise_transcript_text(
@@ -383,9 +396,17 @@ class MiniJarvis:
             except queue.Empty:
                 pass
 
+    def _clear_tts_queue(self) -> None:
+        while True:
+            try:
+                self.tts_queue.get_nowait()
+            except queue.Empty:
+                return
+
     def _barge_in_stop(self) -> None:
         if TTS_PROVIDER != "local" or not BARGE_IN:
             return
+        self._clear_tts_queue()
         if self.speaking and self.tts_engine is not None:
             try:
                 self.tts_engine.stop()
@@ -596,6 +617,12 @@ class MiniJarvis:
 
             print(f"[you] {user_text}")
             self.reset_noise_streak()
+            if command_looks_like_stop(user_text):
+                print("[control] Stop command received")
+                self._barge_in_stop()
+                self.last_reply_at = time.time()
+                return
+
             if not self.should_respond(user_text):
                 if REQUIRE_WAKE_WORD:
                     words = ", ".join(self.wake_words) if self.wake_words else WAKE_WORD
@@ -619,45 +646,49 @@ class MiniJarvis:
             print(f"[error] Turn failed: {exc}")
 
 
-def recv_auth_line(conn: socket.socket) -> Optional[str]:
+def recv_auth_line(conn: socket.socket) -> Tuple[Optional[str], bytes]:
     # Optional auth handshake: client can send first line as 'AUTH <token>\n'.
     conn.settimeout(2.0)
     try:
         first = conn.recv(256)
     except socket.timeout:
         conn.settimeout(None)
-        return None
+        return None, b""
     conn.settimeout(None)
 
     if not first:
-        return ""
+        return "", b""
 
     if b"\n" not in first:
-        return None
+        return None, first
 
-    line, _, _ = first.partition(b"\n")
-    return line.decode(errors="ignore").strip()
+    line, _, rest = first.partition(b"\n")
+    return line.decode(errors="ignore").strip(), rest
 
 
-def authorized(conn: socket.socket) -> bool:
+def authorized(conn: socket.socket) -> Tuple[bool, bytes]:
     if not AUTH_TOKEN:
-        return True
+        return True, b""
 
-    line = recv_auth_line(conn)
+    line, buffered = recv_auth_line(conn)
     if not line:
-        return False
+        return False, b""
 
-    return line == f"AUTH {AUTH_TOKEN}"
+    expected = f"AUTH {AUTH_TOKEN}"
+    return hmac.compare_digest(line, expected), buffered
 
 
 def _handle_client(conn: socket.socket, addr: tuple, bot: "MiniJarvis") -> None:
     """Run in a daemon thread — one thread per ESP32 connection."""
     print(f"Connected: {addr}")
-    if not authorized(conn):
+    ok, buffered = authorized(conn)
+    if not ok:
         print("[security] Unauthorized client rejected")
         conn.close()
         return
     try:
+        if buffered:
+            bot.handle_chunk(buffered)
         while True:
             data = conn.recv(4096)
             if not data:
@@ -696,13 +727,24 @@ def run_server() -> None:
     else:
         print("Wake word mode: OFF")
     print("Waiting for ESP32 connection...")
+    active_client = threading.Lock()
 
     try:
         while True:
             conn, addr = server.accept()
+            if not active_client.acquire(blocking=False):
+                print(f"[warn] Rejecting {addr}: another ESP32 stream is active")
+                conn.close()
+                continue
+
+            def _client_runner() -> None:
+                try:
+                    _handle_client(conn, addr, bot)
+                finally:
+                    active_client.release()
+
             t = threading.Thread(
-                target=_handle_client,
-                args=(conn, addr, bot),
+                target=_client_runner,
                 daemon=True,
             )
             t.start()

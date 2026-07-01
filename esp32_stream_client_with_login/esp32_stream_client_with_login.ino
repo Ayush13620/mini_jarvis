@@ -160,7 +160,8 @@ void loadConfig() {
     // Schema/version mismatch: reset persisted config to avoid stale values.
     prefs.clear();
     prefs.putUInt("cfg_ver", CONFIG_VERSION);
-    prefs.putString("setup_pass", generateSetupPass());
+    setupPass = generateSetupPass();
+    prefs.putString("setup_pass", setupPass);
     prefs.end();
     return;
   }
@@ -218,13 +219,13 @@ void handleSave() {
   String pass = server.arg("wifi_pass");
   String ip = server.arg("server_ip");
   String token = server.arg("auth_token");
-  uint16_t port = (uint16_t)server.arg("server_port").toInt();
-  if (ssid.length() == 0 || pass.length() == 0 || ip.length() == 0 || port == 0) {
+  long requestedPort = server.arg("server_port").toInt();
+  if (ssid.length() == 0 || pass.length() == 0 || ip.length() == 0 || requestedPort <= 0 || requestedPort > 65535) {
     server.send(400, "text/html", configPage("Please fill all required fields"));
     return;
   }
 
-  saveConfig(ssid, pass, ip, port, token);
+  saveConfig(ssid, pass, ip, (uint16_t)requestedPort, token);
   server.send(200, "text/html",
     "<html><body style='font-family:Arial;padding:20px'>Saved. Rebooting...</body></html>");
   delay(700);
@@ -278,6 +279,8 @@ bool connectWiFiStation() {
     return false;
   }
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   Serial.printf("Connecting Wi-Fi: %s\n", wifiSsid.c_str());
   unsigned long start = millis();
@@ -301,6 +304,7 @@ void connectServer() {
   if (now < nextConnectAttemptMs) return;
 
   Serial.printf("Connecting server %s:%u ...\n", serverIp.c_str(), serverPort);
+  client.setTimeout(3);
   if (!client.connect(serverIp.c_str(), serverPort)) {
     Serial.println("Server connect failed");
     nextConnectAttemptMs = now + reconnectDelayMs;
@@ -331,7 +335,7 @@ void streamAudioFrame() {
     // Track slow-moving DC bias and remove it so voice energy is meaningful.
     micDc = (0.995f * micDc) + (0.005f * raw);
     int centered = (int)(raw - micDc);
-    frameBuf[i] = (int32_t)centered;  // send as-is; Python PCM_INT32_GAIN_DIV=1
+    frameBuf[i] = (int32_t)centered;
     absSum += abs(centered);
     if (raw < minRaw) minRaw = raw;
     if (raw > maxRaw) maxRaw = raw;
@@ -364,7 +368,7 @@ void setup() {
 
   loadConfig();
   printConfigToSerial();
-  Serial.println("Serial commands: RESETCFG | SHOWCFG");
+  Serial.println("Serial commands: RESETCFG | SHOWCFG | STATUS");
   Serial.printf("Setup login user/pass: %s / %s\n", SETUP_USER, setupPass.c_str());
   bool ok = connectWiFiStation();
   if (!ok) {

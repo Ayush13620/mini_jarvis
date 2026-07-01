@@ -26,7 +26,7 @@ For ESP32 firmware, open:
 Run Python tests before opening a PR:
 
 ```powershell
-python -m unittest tests.test_core
+python -m unittest discover -v
 ```
 
 ## Coding conventions

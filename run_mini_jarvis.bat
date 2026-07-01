@@ -38,9 +38,16 @@ if not exist ".env" (
 )
 
 echo [5/7] Ensuring Ollama model exists...
-ollama list | findstr /i "qwen2.5:3b-instruct" >nul
+if "%OLLAMA_MODEL%"=="" set OLLAMA_MODEL=qwen3.5:0.8b
+where ollama >nul 2>&1
 if errorlevel 1 (
-  ollama pull qwen2.5:3b-instruct
+  echo Ollama not found. Install it from https://ollama.com/download and retry.
+  pause
+  exit /b 1
+)
+ollama list | findstr /i /c:"%OLLAMA_MODEL%" >nul
+if errorlevel 1 (
+  ollama pull "%OLLAMA_MODEL%"
   if errorlevel 1 (
     echo Could not pull Ollama model.
     pause

@@ -6,8 +6,10 @@ from assistant_server import (
     MIN_SPEECH_MS,
     SAMPLE_RATE,
     SpeechSegmenter,
+    command_looks_like_stop,
     is_noise_transcript_text,
     int32_stream_to_int16,
+    recv_auth_line,
 )
 
 
@@ -29,6 +31,31 @@ class TestNoiseFilter(unittest.TestCase):
 
     def test_normal_sentence_not_filtered(self):
         self.assertFalse(is_noise_transcript_text("what time is it"))
+
+    def test_stop_commands_are_detected(self):
+        self.assertTrue(command_looks_like_stop("stop"))
+        self.assertTrue(command_looks_like_stop("Stop talking."))
+        self.assertTrue(command_looks_like_stop("cancel"))
+        self.assertFalse(command_looks_like_stop("stop the fan"))
+
+
+class FakeSocket:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.timeout = None
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def recv(self, _size):
+        return self.payload
+
+
+class TestAuthHandshake(unittest.TestCase):
+    def test_auth_line_preserves_buffered_audio(self):
+        line, rest = recv_auth_line(FakeSocket(b"AUTH secret\nabcd"))
+        self.assertEqual(line, "AUTH secret")
+        self.assertEqual(rest, b"abcd")
 
 
 class TestSegmenter(unittest.TestCase):

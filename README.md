@@ -22,6 +22,9 @@ This repository is currently an alpha proof-of-concept focused on rapid iteratio
 - `.env.example`: runtime config template
 - `run_mini_jarvis.bat`: one-click launcher
 
+Compatibility wrappers under `mini_jarvis/` delegate to these root files so
+there is one canonical implementation to maintain.
+
 ## Quick start (Windows)
 
 ```powershell
@@ -35,7 +38,7 @@ Copy-Item .env.example .env
 Start Ollama:
 
 ```powershell
-ollama pull qwen2.5:3b-instruct
+ollama pull qwen3.5:0.8b
 ollama serve
 ```
 
@@ -87,6 +90,13 @@ Serial commands:
 
 3. If startup is too slow:
 - use `WHISPER_MODEL=small.en` in `.env`
+- use `OLLAMA_MODEL=qwen3.5:2b` if `qwen3.5:0.8b` is too small for your answers
+
+## AI model choice
+
+The default local chat model is `qwen3.5:0.8b` through Ollama. Qwen does not
+publish an exact local `Qwen 3.5 1B` tag; `0.8B` is the closest latest small
+target, while `qwen3.5:2b` is a stronger option if your laptop has enough RAM.
 
 ## Roadmap
 

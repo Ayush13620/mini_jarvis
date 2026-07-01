@@ -31,9 +31,14 @@ if [ ! -f ".env" ]; then
 fi
 
 echo "[5/7] Checking Ollama model..."
-if ! ollama list 2>/dev/null | grep -qi "qwen2.5:3b-instruct"; then
-  echo "  Pulling qwen2.5:3b-instruct (first run only)..."
-  ollama pull qwen2.5:3b-instruct
+OLLAMA_MODEL_NAME="${OLLAMA_MODEL:-qwen3.5:0.8b}"
+if ! command -v ollama &>/dev/null; then
+  echo "Ollama not found. Install it from https://ollama.com/download and retry."
+  exit 1
+fi
+if ! ollama list 2>/dev/null | awk '{print $1}' | grep -Fxqi "$OLLAMA_MODEL_NAME"; then
+  echo "  Pulling $OLLAMA_MODEL_NAME (first run only)..."
+  ollama pull "$OLLAMA_MODEL_NAME"
 fi
 
 echo "[6/7] Starting Ollama server if not already running..."
