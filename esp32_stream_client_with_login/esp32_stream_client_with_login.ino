@@ -15,10 +15,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
 
 // ===== Audio stream settings =====
 const int MIC_PIN = 34;
-const int SAMPLE_DELAY_US = 47;    // ~16 kHz (analogRead ~15µs + delay ~47µs ≈ 62µs period)
+const int TARGET_SAMPLE_PERIOD_US = 62; // ~16 kHz (1,000,000 / 16,000 ≈ 62.5µs period)
 const int FRAME_SAMPLES = 256;
 // ================================
 
@@ -48,7 +49,7 @@ String setupPass;
 bool setupAuthed = false;
 bool setupMode = false;
 
-int32_t frameBuf[FRAME_SAMPLES];
+int16_t frameBuf[FRAME_SAMPLES];
 unsigned long lastLevelLogMs = 0;
 float micDc = 2048.0f;
 unsigned long nextConnectAttemptMs = 0;
@@ -291,6 +292,9 @@ bool connectWiFiStation() {
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("Wi-Fi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+    if (MDNS.begin("jarvis-esp32")) {
+      Serial.println("mDNS responder started (jarvis-esp32.local)");
+    }
     return true;
   }
   Serial.println("Wi-Fi connect failed");
@@ -303,9 +307,20 @@ void connectServer() {
   unsigned long now = millis();
   if (now < nextConnectAttemptMs) return;
 
-  Serial.printf("Connecting server %s:%u ...\n", serverIp.c_str(), serverPort);
+  String targetIp = serverIp;
+  if (serverIp.endsWith(".local")) {
+    IPAddress resolved;
+    if (WiFi.hostByName(serverIp.c_str(), resolved)) {
+      targetIp = resolved.toString();
+      Serial.printf("Resolved mDNS %s -> %s\n", serverIp.c_str(), targetIp.c_str());
+    } else {
+      Serial.printf("Failed to resolve mDNS hostname %s, trying directly...\n", serverIp.c_str());
+    }
+  }
+
+  Serial.printf("Connecting server %s:%u ...\n", targetIp.c_str(), serverPort);
   client.setTimeout(3);
-  if (!client.connect(serverIp.c_str(), serverPort)) {
+  if (!client.connect(targetIp.c_str(), serverPort)) {
     Serial.println("Server connect failed");
     nextConnectAttemptMs = now + reconnectDelayMs;
     reconnectDelayMs = min(reconnectDelayMs * 2, 10000UL);
@@ -329,17 +344,36 @@ void streamAudioFrame() {
   long absSum = 0;
   int minRaw = 4095;
   int maxRaw = 0;
+  static unsigned long nextSampleUs = 0;
+
+  if (nextSampleUs == 0) {
+    nextSampleUs = micros();
+  }
 
   for (int i = 0; i < FRAME_SAMPLES; i++) {
     int raw = analogRead(MIC_PIN);      // 0..4095
     // Track slow-moving DC bias and remove it so voice energy is meaningful.
     micDc = (0.995f * micDc) + (0.005f * raw);
     int centered = (int)(raw - micDc);
-    frameBuf[i] = (int32_t)centered;
+
+    // Scale 12-bit centered signal (-2048..2047) to 16-bit PCM (-32768..32767)
+    int32_t s16 = centered * 16;
+    if (s16 < -32768) s16 = -32768;
+    if (s16 > 32767) s16 = 32767;
+    frameBuf[i] = (int16_t)s16;
+
     absSum += abs(centered);
     if (raw < minRaw) minRaw = raw;
     if (raw > maxRaw) maxRaw = raw;
-    delayMicroseconds(SAMPLE_DELAY_US);
+
+    nextSampleUs += TARGET_SAMPLE_PERIOD_US;
+    long waitUs = (long)(nextSampleUs - micros());
+    if (waitUs > 0) {
+      delayMicroseconds((unsigned int)waitUs);
+    } else if (waitUs < -5000) {
+      // System lag / Wi-Fi overrun reset
+      nextSampleUs = micros();
+    }
   }
 
   unsigned long now = millis();
@@ -357,6 +391,7 @@ void streamAudioFrame() {
     client.stop();
     nextConnectAttemptMs = millis() + reconnectDelayMs;
     reconnectDelayMs = min(reconnectDelayMs * 2, 10000UL);
+    nextSampleUs = 0;
   }
 }
 

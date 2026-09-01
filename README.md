@@ -10,8 +10,9 @@ This repository is currently an alpha proof-of-concept focused on rapid iteratio
 
 - Works end-to-end with local STT/chat/TTS
 - Includes ESP32 Wi-Fi setup portal + saved config
-- Includes reconnect handling and runtime diagnostics
-- Still has known instability in noisy environments
+- Precision 16kHz audio sampling with 16-bit PCM streaming (50% reduced network bandwidth)
+- Low-latency sentence-chunked LLM response streaming (Ollama & OpenAI)
+- Includes mDNS host discovery (`jarvis-esp32.local`) and reconnect handling
 
 ## Project layout
 

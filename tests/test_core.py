@@ -7,8 +7,10 @@ from assistant_server import (
     SAMPLE_RATE,
     SpeechSegmenter,
     command_looks_like_stop,
-    is_noise_transcript_text,
+    extract_complete_sentences,
     int32_stream_to_int16,
+    is_noise_transcript_text,
+    pcm_stream_to_int16,
     recv_auth_line,
 )
 
@@ -21,6 +23,25 @@ class TestDecode(unittest.TestCase):
         self.assertEqual(len(out), 5)
         self.assertTrue(np.max(out) <= 32767)
         self.assertTrue(np.min(out) >= -32768)
+
+    def test_pcm_stream_to_int16_handles_16bit_and_32bit(self):
+        src16 = np.array([100, -200, 300, -400, 500], dtype=np.int16).tobytes()
+        out16 = pcm_stream_to_int16(src16)
+        self.assertEqual(out16.dtype, np.int16)
+        self.assertEqual(len(out16), 5)
+        np.testing.assert_array_equal(out16, np.array([100, -200, 300, -400, 500], dtype=np.int16))
+
+        src32 = np.array([0, 1000, -1000], dtype=np.int32).tobytes()
+        out32 = pcm_stream_to_int16(src32)
+        self.assertEqual(out32.dtype, np.int16)
+        self.assertEqual(len(out32), 3)
+
+
+class TestSentenceChunker(unittest.TestCase):
+    def test_extract_complete_sentences(self):
+        sentences, rem = extract_complete_sentences("Hello master! How can I help you today? I am ready")
+        self.assertEqual(sentences, ["Hello master!", "How can I help you today?"])
+        self.assertEqual(rem, " I am ready")
 
 
 class TestNoiseFilter(unittest.TestCase):

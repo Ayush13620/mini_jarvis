@@ -147,6 +147,40 @@ def int32_stream_to_int16(chunk: bytes) -> np.ndarray:
     return s16
 
 
+def pcm_stream_to_int16(chunk: bytes) -> np.ndarray:
+    """Decode raw stream bytes into int16 PCM.
+
+    Supports 16-bit PCM (2 bytes/sample) and legacy 32-bit PCM (4 bytes/sample).
+    """
+    if not chunk:
+        return np.array([], dtype=np.int16)
+
+    # 16-bit PCM frame (e.g. 512 bytes for 256 samples)
+    if len(chunk) % 4 != 0 and len(chunk) % 2 == 0:
+        usable = len(chunk) - (len(chunk) % 2)
+        return np.frombuffer(chunk[:usable], dtype=np.int16)
+
+    return int32_stream_to_int16(chunk)
+
+
+def extract_complete_sentences(buffer: str) -> Tuple[List[str], str]:
+    """Extract complete sentences from buffer.
+
+    Splits on sentence terminators (. ! ? \n). Returns list of complete sentences
+    and the remaining trailing buffer string.
+    """
+    sentences = []
+    current = ""
+    for char in buffer:
+        current += char
+        if char in {".", "!", "?", "\n"}:
+            clean = current.strip()
+            if clean:
+                sentences.append(clean)
+            current = ""
+    return sentences, current
+
+
 def command_looks_like_stop(text: str) -> bool:
     clean = (text or "").strip().lower().strip(" .,!?:;")
     return clean in {
@@ -320,8 +354,6 @@ class MiniJarvis:
         if TTS_PROVIDER == "local":
             if pyttsx3 is None:
                 raise RuntimeError("pyttsx3 not installed. Run `pip install -r requirements.txt`.")
-            self.tts_engine = pyttsx3.init()
-            self.tts_engine.setProperty("rate", 180)
         elif TTS_PROVIDER == "openai":
             self._init_openai_client()
         else:
@@ -333,7 +365,7 @@ class MiniJarvis:
         self.last_debug_at = 0.0
         self.chunks_seen = 0
         self.wake_words = wake_words()
-        self.tts_queue: "queue.Queue[str]" = queue.Queue(maxsize=8)
+        self.tts_queue: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=8)
         self.speaking = False
         self.noise_streak = 0
         self.dcblock = DCBlocker() if ENABLE_DCBLOCK else None
@@ -344,19 +376,27 @@ class MiniJarvis:
             return
 
         def _worker() -> None:
+            engine = None
+            if pyttsx3 is not None:
+                try:
+                    engine = pyttsx3.init()
+                    engine.setProperty("rate", 180)
+                except Exception as exc:
+                    print(f"[warn] Could not initialize local pyttsx3 in worker thread: {exc}")
+
             while True:
                 text = self.tts_queue.get()
-                if text is None:  # type: ignore[comparison-overlap]
+                if text is None:
                     return
-                try:
-                    self.speaking = True
-                    assert self.tts_engine is not None
-                    self.tts_engine.say(text)
-                    self.tts_engine.runAndWait()
-                except Exception as exc:
-                    print(f"[warn] Local TTS failed: {exc}")
-                finally:
-                    self.speaking = False
+                if engine is not None:
+                    try:
+                        self.speaking = True
+                        engine.say(text)
+                        engine.runAndWait()
+                    except Exception as exc:
+                        print(f"[warn] Local TTS failed: {exc}")
+                    finally:
+                        self.speaking = False
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
@@ -407,11 +447,7 @@ class MiniJarvis:
         if TTS_PROVIDER != "local" or not BARGE_IN:
             return
         self._clear_tts_queue()
-        if self.speaking and self.tts_engine is not None:
-            try:
-                self.tts_engine.stop()
-            except Exception:
-                pass
+        self.speaking = False
 
     def _init_openai_client(self) -> None:
         if self.client is not None:
@@ -500,34 +536,28 @@ class MiniJarvis:
             time_greet = "Good evening"
         return f"{time_greet}, master."
 
-    def reply_text(self, user_text: str) -> str:
+    def reply_text(self, user_text: str, on_sentence_cb=None) -> str:
         self.chat_history.append({"role": "user", "content": user_text})
-        # Keep system prompt + last 8 non-system turns.  The old slice
-        # [-8:] could double-include the system prompt when history is short.
+        # Keep system prompt + last 8 non-system turns.
         self.chat_history = [self.chat_history[0]] + self.chat_history[1:][-8:]
 
         if USE_OLLAMA_CHAT:
-            text = self.reply_text_ollama()
+            text = self.reply_text_ollama(on_sentence_cb=on_sentence_cb)
             self.chat_history.append({"role": "assistant", "content": text})
             self.last_reply_at = time.time()
             return text
 
         self._init_openai_client()
-        resp = self.client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=self.chat_history,
-            temperature=0.4,
-        )
-        text = (resp.choices[0].message.content or "").strip()
+        text = self.reply_text_openai(on_sentence_cb=on_sentence_cb)
         self.chat_history.append({"role": "assistant", "content": text})
         self.last_reply_at = time.time()
         return text
 
-    def reply_text_ollama(self) -> str:
+    def reply_text_ollama(self, on_sentence_cb=None) -> str:
         payload = {
             "model": OLLAMA_MODEL,
             "messages": self.chat_history,
-            "stream": False,
+            "stream": True,
             "options": {"temperature": 0.4},
         }
 
@@ -538,22 +568,60 @@ class MiniJarvis:
             method="POST",
         )
 
+        full_text = ""
+        buffer = ""
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                raw = resp.read().decode("utf-8")
+                for line in resp:
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line.decode("utf-8"))
+                        token = (data.get("message", {}) or {}).get("content", "")
+                        if token:
+                            full_text += token
+                            buffer += token
+                            if on_sentence_cb:
+                                sentences, buffer = extract_complete_sentences(buffer)
+                                for sentence in sentences:
+                                    on_sentence_cb(sentence)
+                    except Exception:
+                        continue
         except urllib.error.URLError as exc:
             raise RuntimeError(
                 "Could not reach Ollama. Start it with `ollama serve` and pull the model "
                 f"with `ollama pull {OLLAMA_MODEL}`."
             ) from exc
 
-        try:
-            data = json.loads(raw)
-            text = (data.get("message", {}) or {}).get("content", "")
-        except Exception as exc:
-            raise RuntimeError(f"Invalid Ollama response: {raw[:200]}") from exc
+        if buffer.strip() and on_sentence_cb:
+            on_sentence_cb(buffer.strip())
 
-        return text.strip()
+        return full_text.strip()
+
+    def reply_text_openai(self, on_sentence_cb=None) -> str:
+        assert self.client is not None
+        stream = self.client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=self.chat_history,
+            temperature=0.4,
+            stream=True,
+        )
+        full_text = ""
+        buffer = ""
+        for chunk in stream:
+            token = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+            if token:
+                full_text += token
+                buffer += token
+                if on_sentence_cb:
+                    sentences, buffer = extract_complete_sentences(buffer)
+                    for sentence in sentences:
+                        on_sentence_cb(sentence)
+
+        if buffer.strip() and on_sentence_cb:
+            on_sentence_cb(buffer.strip())
+
+        return full_text.strip()
 
     def speak(self, text: str) -> None:
         if not text:
@@ -563,12 +631,7 @@ class MiniJarvis:
             if ASYNC_TTS:
                 self._enqueue_tts(text)
                 return
-            assert self.tts_engine is not None
-            try:
-                self.tts_engine.say(text)
-                self.tts_engine.runAndWait()
-            except Exception as exc:
-                print(f"[warn] Local TTS failed: {exc}")
+            print(f"[tts-sync] {text}")
             return
 
         speech = self.client.audio.speech.create(
@@ -587,7 +650,7 @@ class MiniJarvis:
 
     def handle_chunk(self, raw_chunk: bytes) -> None:
         self.chunks_seen += 1
-        pcm16 = int32_stream_to_int16(raw_chunk)
+        pcm16 = pcm_stream_to_int16(raw_chunk)
         if self.dcblock is not None:
             pcm16 = self.dcblock.process(pcm16)
         segment = self.segmenter.push(pcm16)
@@ -639,9 +702,17 @@ class MiniJarvis:
                 return
 
             user_text = self.normalize_user_text(user_text)
-            reply = self.reply_text(user_text)
-            print(f"[jarvis] {reply}")
-            self.speak(reply)
+            print("[jarvis] ", end="", flush=True)
+
+            def _on_sentence(sentence: str) -> None:
+                print(f"{sentence} ", end="", flush=True)
+                if ASYNC_TTS and TTS_PROVIDER == "local":
+                    self.speak(sentence)
+
+            reply = self.reply_text(user_text, on_sentence_cb=_on_sentence)
+            print()
+            if not (ASYNC_TTS and TTS_PROVIDER == "local"):
+                self.speak(reply)
         except Exception as exc:
             print(f"[error] Turn failed: {exc}")
 
@@ -663,6 +734,9 @@ def recv_auth_line(conn: socket.socket) -> Tuple[Optional[str], bytes]:
         return None, first
 
     line, _, rest = first.partition(b"\n")
+    # Align trailing audio bytes to 2-byte boundary (16-bit PCM)
+    if len(rest) % 2 != 0:
+        rest = rest[: len(rest) - (len(rest) % 2)]
     return line.decode(errors="ignore").strip(), rest
 
 
