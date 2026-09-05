@@ -19,7 +19,6 @@ ESP32 mic stream → Python server (VAD + STT) → Ollama chat → pyttsx3 TTS �
 ### Linux
 
 ```bash
-cd offline
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -39,7 +38,6 @@ bash run_mini_jarvis.sh
 ### Windows
 
 ```powershell
-cd offline
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
